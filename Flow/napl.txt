@@ -1,0 +1,43 @@
+********************************************************
+*
+* MEMORIASZIVARGAS VAN A PROGRAMBAN!!!
+*
+********************************************************
+** DEBUGMALLOC DUMP ************************************
+
+  MEMORIATERULET: 008889B8, kanari: ok
+    foglalva itt: d:\bme\prog1\elmelet\flow\flow\main.c:730
+    foglalas modja: malloc(sizeof(FlowElement)) (20 bajt)
+    memoria eleje: 
+      0000  f8 43 88 00 e8 8b 88 00 04 00 02 00 fa 6b 27 ac   .C...........k'.
+      0010  05 00 00 00                                       ....            
+
+  MEMORIATERULET: 00888788, kanari: ok
+    foglalva itt: d:\bme\prog1\elmelet\flow\flow\main.c:782
+    foglalas modja: malloc(sizeof(FlowElement)) (20 bajt)
+    memoria eleje: 
+      0000  98 d9 87 00 58 85 88 00 03 00 00 00 83 74 af 34   ....X........t.4
+      0010  06 00 00 00                                       ....            
+
+  MEMORIATERULET: 00887EC8, kanari: ok
+    foglalva itt: d:\bme\prog1\elmelet\flow\flow\main.c:730
+    foglalas modja: malloc(sizeof(FlowElement)) (20 bajt)
+    memoria eleje: 
+      0000  00 3b 88 00 f8 80 88 00 02 00 02 00 cd 7b 73 f3   .;...........{s.
+      0010  05 00 00 00                                       ....            
+
+  MEMORIATERULET: 00887C98, kanari: ok
+    foglalva itt: d:\bme\prog1\elmelet\flow\flow\main.c:782
+    foglalas modja: malloc(sizeof(FlowElement)) (20 bajt)
+    memoria eleje: 
+      0000  70 3f 88 00 68 7a 88 00 01 00 00 00 a8 d4 4a c9   p?..hz........J.
+      0010  06 00 00 00                                       ....            
+
+  MEMORIATERULET: 00882DA0, kanari: ok
+    foglalva itt: d:\bme\prog1\elmelet\flow\flow\main.c:730
+    foglalas modja: malloc(sizeof(FlowElement)) (20 bajt)
+    memoria eleje: 
+      0000  c8 db 87 00 d0 2e 88 00 00 00 01 00 d0 37 27 e2   .............7'.
+      0010  05 00 00 00                                       ....            
+
+** DEBUGMALLOC DUMP VEGE *******************************

@@ -1,0 +1,2106 @@
+/*
+TODO:
+-free memory at exit
+-make more default levels
+-simplifying and shortening code
+-document code
+*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <SDL.h>
+#include <SDL_gfxPrimitives.h>
+#include <SDL_framerate.h>
+#include <SDL_ttf.h>
+#include <SDL_image.h>
+
+typedef enum GameState
+{
+	MainMenu,
+	LevelSelectMenu,
+	TimeTrialMenu,
+	UserLevelLoading,
+	AboutMenu,
+	ActiveGame,
+	GameOver,
+	Exit
+} GameState;
+
+typedef struct Vector
+{
+	int x, y;
+} Vector;
+
+typedef enum FlowElementState
+{
+	End, Inner
+} FlowElementState;
+
+typedef enum FlowElementShape
+{
+	None = 0,
+	UpS = (1<<0),
+	RightS = (1<<1),
+	DownS = (1<<2),
+	LeftS = (1<<3),
+	EndS = (1<<4)
+} FlowElementShape;
+
+typedef struct FlowElement
+{
+	struct FlowElement *prev, *next;
+	Vector position;
+	FlowElementState type;
+	FlowElementShape shape;
+} FlowElement;
+
+typedef struct Flow
+{
+	struct Flow *next;
+	FlowElement *flowElementRoot;
+	SDL_Color color;
+	int completed;
+} Flow;
+
+typedef enum LevelState
+{
+	Uncompleted, Completed, Starred
+} LevelState;
+
+typedef struct Level
+{
+	Flow *flowRoot;
+	LevelState state;
+	unsigned int timeRecord;
+	int size, flowCount, completedFlowCount, name;
+} Level;
+
+typedef	struct MenuItem
+{
+	char *name, mouseDown, mouseOver;
+	GameState gameState;
+	SDL_Color color;
+} MenuItem;
+
+typedef	struct TimeTrialMenuItem
+{
+	char *name, mouseDown, mouseOver;
+	int index, time;
+	SDL_Color color;
+} TimeTrialMenuItem;
+
+typedef	struct Button
+{
+	Vector position;
+	GameState gameState;
+	SDL_Surface *picture;
+} Button;
+
+typedef	struct LevelTile
+{
+	Vector position;
+	char mouseDown;
+} LevelTile;
+
+typedef enum MouseButtonState
+{
+	Up, Down, JustUp, JustDown
+} MouseButtonState;
+
+const int
+	FONTSIZE_BIG = 130,
+	FONTSIZE_NORMAL = 50,
+	FONTSIZE_SMALL = 13,
+	MAINMENU_ITEM_MARGIN = 200,
+	LEVEL_TILE_MARGIN_TOP = 150,
+	LEVEL_TILE_PADDING = 5,
+	LEVEL_TILE_SIZE = 130,
+	GAME_AREA_SIZE = 400,
+	GAME_AREA_GRID_WIDTH = 3,
+	FLOW_WIDTH_PERCENT = 27,
+	FLOW_END_WITDH_PERCENT = 54,
+	FLOW_BG_OPACITY = 7,
+	LEVEL_CHANGE_ARROW_DIST = 60,
+	TIME_TRIAL_MARGIN = 50,
+	GAME_OVER_AREA_WIDTH = 250;
+const SDL_Color
+	LEVELTILE_COLOR = {96, 255, 47, 0},
+	GAME_AREA_GRID_COLOR = {0, 15, 0, 0},
+	FLOWCOLORS[] = {
+		255, 0, 0, 0,
+		255, 255, 0, 0, //yellow
+		0, 255, 0, 0,
+		0, 0, 255, 0,
+		0, 255, 255, 0, //cyan
+		255, 124, 0, 0, //orange
+		40, 150, 90, 0,
+};
+FPSmanager fpsM;
+SDL_Surface *screen, *leftArrowPic, *leftArrowSelectedPic, *rightArrowPic,
+	*rightArrowSelectedPic, *starPic, *cMarkPic, *menuPic, *menuSelectedPic,
+	*reloadPic, *reloadSelectedPic;
+TTF_Font *fontTitle, *fontNormal, *fontSmall;
+GameState gameState;
+Level *levels, *defaultLevels, *userLevels;
+int currentLevelIndex, currentLevelCount, defaultLevelCount, userLevelCount,
+	currentLevelSelectPage, levelSelectPageCount, innerFlowElementCount,
+	currentTimeTTime, currentTimeTScore, timeTHighScores[3],
+	timeTScoreIndex;
+char exiting, screenBlurred, loadUserLevel, KeysDown[SDLK_LAST+1] = {0},
+	*userLevelError = NULL, isTimeTrialGame;
+long currentTime;
+Uint32 aboutAnimation;
+MouseButtonState LMB;
+Vector mousePositionDown, t = {0, 0}; //TODO: felengedéskor is jó legyen
+MenuItem mainMenuItems[] = {
+	"arcade", 0, 0, LevelSelectMenu, {250,34,49},
+	"time trial", 0, 0, TimeTrialMenu, {255,191,31},
+	"user level", 0, 0, UserLevelLoading, {191,255,50},
+	"about", 0, 0, AboutMenu, {171,227,25},
+	"exit", 0, 0, Exit, {0, 196, 129}};
+Button arrowBack = {12, 33, MainMenu, NULL},
+	arrowNext = {0, 300, ActiveGame, NULL},
+	arrowPrev = {0, 300, LevelSelectMenu, NULL},
+	reload = {0, 300, ActiveGame, NULL},
+	menuButton = {0, 300, LevelSelectMenu, NULL};
+TimeTrialMenuItem timeTrialMenuItems[] = {
+	"30 sec", 0, 0, 0, 30, {250,34,49},
+	"60 sec", 0, 0, 1, 60, {255,191,31},
+	"90 sec", 0, 0, 2, 90, {191,255,50}};
+LevelTile levelTiles[9] = {0};
+FlowElement *flowElementStart;
+
+__inline int Max(int a, int b) {
+	return a > b ? a : b;
+}
+
+__inline int Min(int a, int b) {
+	return a < b ? a : b;
+}
+
+/// <summary>rentF
+/// Clears the surface to a specific color.
+/// </summary>
+/// <param name="surface">The surface.</param>
+/// <param name="color">The color.</param>
+void ClearSurface(SDL_Surface *surface, Uint32 color)
+{
+	Uint8 *pixels;
+	int i;
+	if (SDL_LockSurface(surface) == 0)
+	{
+		pixels = (Uint8 *)surface->pixels;
+		for (i=0; i < surface->h; i++)
+		{
+			memset(pixels, color, surface->w*surface->format->BytesPerPixel);
+			pixels += surface->pitch;
+		}
+		SDL_UnlockSurface(surface);
+	}
+}
+
+void PrintString(SDL_Surface *surface, SDL_Rect rect, TTF_Font *font, char *text, SDL_Color fg, SDL_Color bg)
+{
+	SDL_Surface *fontSurface = TTF_RenderText_Shaded(font, text, fg, bg);
+	if(fontSurface)
+	{
+		SDL_BlitSurface(fontSurface, 0, screen, &rect);
+		SDL_FreeSurface(fontSurface);
+	}
+}
+
+SDL_Color Darken(SDL_Color color, double amount)
+{
+	SDL_Color ret;
+	ret.r = (int) Max(0, color.r - 255 * amount);
+	ret.g = (int) Max(0, color.g - 255 * amount);
+	ret.b = (int) Max(0, color.b - 255 * amount);
+	return ret;
+}
+
+Uint32 SDLColorTo32bit(SDL_Color color)
+{
+	Uint32 ret, t;
+	t = color.r;
+	ret = t << 24;
+	t = color.g;
+	ret |= t << 16;
+	t = color.b;
+	ret |= t << 8;
+	return ret |= 0xff;
+}
+
+Uint32 SetOpacity(Uint32 color, int percent)
+{
+	return ((color>>8)<<8) | (Uint32)((double)0xff*(double)percent/100);
+}
+
+Uint32 GetPixel(SDL_Surface *surface, int x, int y)
+{
+	int bpp = surface->format->BytesPerPixel;
+	Uint8 *p = (Uint8 *)surface->pixels + y * surface->pitch + x * bpp;
+	switch (bpp)
+	{
+	case 1:
+		return *p;
+	case 2:
+		return *(Uint16 *)p;
+	case 3:
+		if (SDL_BYTEORDER == SDL_BIG_ENDIAN)
+			return p[0] << 16 | p[1] << 8 | p[2];
+		else
+			return p[0] | p[1] << 8 | p[2] << 16;
+	case 4:
+		return *(Uint32 *)p;
+	default:
+		return 0;
+	}
+}
+
+void SetPixel(SDL_Surface *surface, int x, int y, Uint32 pixel)
+{
+	int bpp = surface->format->BytesPerPixel;
+	Uint8 *p = (Uint8 *)surface->pixels + y * surface->pitch + x * bpp;
+	switch (bpp)
+	{
+	case 1:
+		*p = pixel;
+		break;
+	case 2:
+		*(Uint16 *)p = pixel;
+		break;
+	case 3:
+		if (SDL_BYTEORDER == SDL_BIG_ENDIAN) {
+			p[0] = (pixel >> 16) & 0xff;
+			p[1] = (pixel >> 8) & 0xff;
+			p[2] = pixel & 0xff;
+		}
+		else {
+			p[0] = pixel & 0xff;
+			p[1] = (pixel >> 8) & 0xff;
+			p[2] = (pixel >> 16) & 0xff;
+		}
+		break;
+	case 4:
+		*(Uint32 *)p = pixel;
+		break;
+	default:
+		break;
+	}
+}
+
+SDL_Surface *FlipH(SDL_Surface *surface)
+{
+	SDL_Surface *ret = NULL;
+	int x, y, rx, ry;
+	if(SDL_MUSTLOCK(surface))
+		SDL_LockSurface(surface);
+	ret = SDL_CreateRGBSurface(SDL_SWSURFACE, surface->w, surface->h,
+		surface->format->BitsPerPixel, surface->format->Rmask,
+		surface->format->Gmask, surface->format->Bmask, surface->format->Amask);
+	for(x = 0, rx = ret->w - 1; x < ret->w; x++, rx--)
+		for(y = 0, ry = ret->h - 1; y < ret->h; y++, ry--)
+			SetPixel(ret, rx, y, GetPixel(surface, x, y));
+	if(SDL_MUSTLOCK(surface))
+		SDL_UnlockSurface(surface);
+	return ret;
+}
+
+void BlurH(SDL_Surface *surface, int amount)
+{
+	int x, y, hits, oldPixel, newPixel, bpp;
+	Uint32 color, *newColors, a[3];
+	bpp = surface->format->BytesPerPixel;
+	newColors = (Uint32 *)malloc(surface->w * sizeof(Uint32 *));
+	for (y = 0; y < surface->h; y++)
+	{
+		hits = 0;
+		a[0] = a[1] = a[2] = 0;
+		for (x = -amount; x < surface->w; x++)
+		{
+			oldPixel = x - amount - 1;
+			if (oldPixel >= 0)
+			{
+				color = *(Uint32*)((Uint8 *)surface->pixels + y * surface->pitch + oldPixel * 4); //bpp
+				if (color != 0)
+				{
+					a[0] -= (color & 0xff0000) >> 16;
+					a[1] -= (color & 0xff00) >> 8;
+					a[2] -= (color & 0xff);
+				}
+				hits--;
+			}
+			newPixel = x + amount;
+			if (newPixel < surface->w)
+			{
+				color = *(Uint32*)((Uint8 *)surface->pixels + y * surface->pitch + newPixel * 4);
+				if (color != 0)
+				{
+					a[0] += (color & 0xff0000) >> 16;
+					a[1] += (color & 0xff00) >> 8;
+					a[2] += (color & 0xff);
+				}
+				hits++;
+			}
+			if (x >= 0)
+			{
+				newColors[x] = (((int)((double)a[0] / hits)) << 16)
+					| (((int)((double)a[1] / hits)) << 8)
+					| (int)((double)a[2] / hits);
+			}
+		}
+		for (x = 0; x < surface->w; x++)
+			*(Uint32*)((Uint8 *)surface->pixels + y * surface->pitch + x * 4) = newColors[x];
+	}
+	free(newColors);
+}
+
+void BlurW(SDL_Surface *surface, int amount)
+{
+	int x, y, hits, oldPixel, newPixel;
+	Uint32 color, *newColors, a[3];
+	newColors = (Uint32 *)malloc(surface->h * sizeof(Uint32 *));
+	for (x = 0; x < surface->w; x++)
+	{
+		hits = 0;
+		a[0] = a[1] = a[2] = 0;
+		for (y = -amount; y < surface->h; y++)
+		{
+			oldPixel = y - amount - 1;
+			if (oldPixel >= 0)
+			{
+				color = *(Uint32*)((Uint8 *)surface->pixels + oldPixel * surface->pitch + x * 4);
+				if (color != 0)
+				{
+					a[0] -= (color & 0xff0000) >> 16;
+					a[1] -= (color & 0xff00) >> 8;
+					a[2] -= (color & 0xff);
+				}
+				hits--;
+			}
+			newPixel = y + amount;
+			if (newPixel < surface->h)
+			{
+				color = *(Uint32*)((Uint8 *)surface->pixels + newPixel * surface->pitch + x * 4);
+				if (color != 0)
+				{
+					a[0] += (color & 0xff0000) >> 16;
+					a[1] += (color & 0xff00) >> 8;
+					a[2] += (color & 0xff);
+				}
+				hits++;
+			}
+			if (y >= 0)
+			{
+				newColors[y] = (((int)((double)a[0] / hits)) << 16)
+					| (((int)((double)a[1] / hits)) << 8)
+					| (int)((double)a[2] / hits);
+			}
+		}
+		for (y = 0; y < surface->h; y++)
+			*(Uint32*)((Uint8 *)surface->pixels + y * surface->pitch + x * 4) = newColors[y];
+	}
+	free(newColors);
+}
+
+Level *LoadLevels(FILE *file, int *count)
+{
+	char c;
+	int i = 0, flowColor, j, tombMeret = 0;
+	Flow *flow;
+	Level *levels = NULL, *levelTemp;
+	while (1)
+	{
+		if(i == tombMeret)
+		{
+			levelTemp = (Level *)malloc(sizeof(Level)*(tombMeret+1));
+			for (j = 0; j < tombMeret; j++)
+			{
+				levelTemp[j] = levels[j];
+			}
+			if (levels)
+				free(levels);
+			levels = levelTemp;
+			levels[i].flowRoot = NULL;
+			levels[i].completedFlowCount = 0;
+			tombMeret++;
+		}
+		if (levels[i].flowRoot == NULL)
+		{
+			for(c = fgetc(file); c != EOF && c != '{'; c = fgetc(file));
+			if (c == EOF)
+				return NULL;
+			levels[i].flowRoot = (Flow *)malloc(sizeof(Flow));
+			if (levels[i].flowRoot == NULL)
+				return NULL;
+			levels[i].flowCount = 0;
+			levels[i].name = i+1;
+			flow = levels[i].flowRoot;
+			flow->completed = 0;
+			flowColor = 0;
+			flow->color = FLOWCOLORS[flowColor];
+		}
+
+		levels[i].flowCount++;
+		flow->next = NULL;
+		flow->flowElementRoot = (FlowElement *)malloc(sizeof(FlowElement));
+		if(flow->flowElementRoot == NULL)
+			return NULL;
+		if(fscanf(file, "{%d,", &(flow->flowElementRoot->position.x)) < 1)
+			return NULL;
+		if(fscanf(file, "%d,", &(flow->flowElementRoot->position.y)) < 1)
+			return NULL;
+
+		flow->flowElementRoot->type = End;
+		flow->flowElementRoot->next = NULL;
+		flow->flowElementRoot->prev = (FlowElement *)malloc(sizeof(FlowElement));
+		if (flow->flowElementRoot->prev == NULL)
+			return NULL;
+		flow->flowElementRoot->prev->prev = NULL;
+		flow->flowElementRoot->prev->next = flow->flowElementRoot;
+		if(fscanf(file, "%d,", &(flow->flowElementRoot->prev->position.x)) < 1)
+			return NULL;
+		if(fscanf(file, "%d},", &(flow->flowElementRoot->prev->position.y)) < 1)
+			return NULL;
+		flow->flowElementRoot->position.x--;
+		flow->flowElementRoot->position.y--;
+		flow->flowElementRoot->prev->position.x--;
+		flow->flowElementRoot->prev->position.y--;
+		flow->flowElementRoot->prev->type = End;
+		flow->color = FLOWCOLORS[flowColor++];
+		if(fscanf(file, "%d,", &(levels[i].size)) < 1)
+		{
+			flow->next = (Flow *)malloc(sizeof(Flow));
+			if (flow->next == NULL)
+				return NULL;
+			flow = flow->next;
+			continue;
+		}
+		if(fscanf(file, "%d,", &(levels[i].state)) < 1)
+			return NULL;
+		if(fscanf(file, "%d}", &(levels[i].timeRecord)) < 1)
+			return NULL;
+		if ((c = fgetc(file)) == EOF)
+		{
+			*count = tombMeret;
+			return levels;
+		}
+		else
+			i++;
+	}
+}
+
+int RemoveFlowElement(int xIn, int yIn, char removeThis)
+{
+	Flow *f;
+	FlowElement *fElem1, *fElem2;
+	char circular, startsAtFirst;
+	int a, b;
+	for (f = levels[currentLevelIndex].flowRoot; f != NULL; f = f->next)
+	{
+		startsAtFirst = f->flowElementRoot->next != NULL ? 1 : 0;
+		circular = 0;
+		for (fElem1 = f->flowElementRoot; fElem1->prev != NULL; fElem1 = fElem1->prev)
+		{
+			if (fElem1->prev == f->flowElementRoot)
+			{
+				fElem1 = f->flowElementRoot;
+				circular = 1;
+				break;
+			}
+		}
+		fElem2 = fElem1;
+		for (; fElem1 != NULL; fElem1 = fElem1->next) //iterate through all FlowElement
+		{
+			if (fElem1->position.x == xIn && fElem1->position.y == yIn)
+			{
+				if (fElem1->type == Inner)
+				{
+					if (circular)
+					{
+						//remove from xy until end (remove the shorter part)
+						for (fElem2 = fElem1->next, a = 0; fElem2->type != End; fElem2 = fElem2->next, a++);
+						for (fElem2 = fElem1->prev, b = 0; fElem2->type != End; fElem2 = fElem2->prev, b++);
+						if (!removeThis)
+						{
+							if (a > b)
+								fElem1 = fElem1->prev;
+							else
+								fElem1 = fElem1->next;
+						}
+						if (a > b)
+						{
+							fElem1->next->prev = NULL;
+							fElem1->next = NULL;
+						}
+						else
+						{
+							fElem1->prev->next = NULL;
+							fElem1->prev = NULL;
+						}
+						for (fElem1 = (a > b ? fElem1->prev : fElem1->next);
+							(a > b ? fElem1->next : fElem1->prev)->type != End;
+							fElem1 = (a > b ? fElem1->prev : fElem1->next))
+						{
+							free(a>b?fElem1->next:fElem1->prev);
+							if (a>b)
+								fElem1->next = NULL;
+							else
+								fElem1->prev = NULL;
+							innerFlowElementCount--;
+						}
+						levels[currentLevelIndex].completedFlowCount--;
+						return 1;
+					}
+					else
+					{
+						//remove all after xy
+						if (startsAtFirst)
+							fElem1->prev->next = NULL;
+						else
+							fElem1->next->prev = NULL;
+						do
+						{
+							fElem2 = startsAtFirst ? fElem1->next : fElem1->prev;
+							free(fElem1);
+							fElem1 = fElem2;
+							innerFlowElementCount--;
+						}
+						while (fElem1);
+						return 1;
+					}
+				}
+				else
+					return 0; //End at xy
+			}
+			if (fElem1->next == fElem2) //has gone around
+				break;
+		}
+	}
+	return 1;
+}
+
+int MakeRoute(int x, int y)
+{
+	int i, j, circular;
+	FlowElement *fe1, *fe2;
+
+	if (flowElementStart == NULL)
+		return 0;
+	//if circular list the flow is already completed
+	circular = 0;
+	for (fe1 = flowElementStart; fe1->next != NULL; fe1 = fe1->next)
+	{
+		if (fe1->next == flowElementStart)
+		{
+			circular = 1;
+			break;
+		}
+	}
+	if (circular)
+	{
+		if (flowElementStart->position.x == x && flowElementStart->position.y == y)
+		{
+			if (flowElementStart->type == End) //remove all inner flowelement
+			{
+				if (flowElementStart->next->type == End)
+				{
+					RemoveFlowElement(flowElementStart->next->next->position.x,
+						flowElementStart->next->next->position.y, 1);
+					RemoveFlowElement(flowElementStart->prev->position.x,
+						flowElementStart->prev->position.y, 1);
+				}
+				else
+				{
+					RemoveFlowElement(flowElementStart->prev->prev->position.x,
+						flowElementStart->prev->prev->position.y, 1);
+					RemoveFlowElement(flowElementStart->next->position.x,
+						flowElementStart->next->position.y, 1);
+				}
+			}
+			else
+				RemoveFlowElement(flowElementStart->position.x, flowElementStart->position.y, 0);
+		}
+		else //completed flow, but not released mouse yet
+		{
+			//find flowelement under mouse if there is
+			for (fe1 = flowElementStart; fe1->next != flowElementStart &&
+				(fe1->position.x != x || fe1->position.y != y); fe1 = fe1->next){}
+			if (fe1->next != flowElementStart && fe1->type != End)
+			{
+				if (fe1->next->type == End)
+				{
+					fe1->next->prev = NULL;
+					fe1->next = NULL;
+					levels[currentLevelIndex].completedFlowCount--;
+				}
+				else if (fe1->prev->type == End)
+				{
+					fe1->prev->next = NULL;
+					fe1->prev = NULL;
+					levels[currentLevelIndex].completedFlowCount--;
+				}
+			}
+		}
+	}
+	else //not circular
+	{
+		for (fe1 = flowElementStart; fe1->next != NULL; fe1 = fe1->next)
+			if (fe1->next->type == End)
+				break;
+		//starts from the first
+		if (fe1->next == NULL)
+		{
+			printf("dsd");
+			//remove following FLowElements
+			//while not reach End or the mouse pos
+			for(; fe1->type != End && (fe1->position.x != x || fe1->position.y != y); fe1 = fe1->prev);
+			//reached the end -> xy are not in the flow
+			//remove flowElements after xy
+			if (fe1->type != End || (fe1->position.x == x && fe1->position.y == y))
+			{
+				fe2 = fe1;
+				for(; fe1->next != NULL; fe1 = fe1->next);
+				for(fe1 = fe1->prev; fe1->next != fe2; fe1 = fe1->prev)
+				{
+					if (fe1->next == flowElementStart)
+						flowElementStart = fe2;
+					free(fe1->next);
+					fe1->next = NULL;
+					innerFlowElementCount--;
+				}
+			}
+			//add new FLowElements
+			if (flowElementStart->position.x != x || flowElementStart->position.y != y)
+			{
+				for(fe1 = flowElementStart; fe1-> next != NULL; fe1 = fe1->next);
+				//vertical line
+				if (fe1->position.x == x)
+				{
+					j = fe1->position.y < y ? 1 : -1;
+					for (i = fe1->position.y + j; i-j != y; i += j)
+					{
+						if(RemoveFlowElement(x, i, 1))
+						{
+							fe1->next = (FlowElement *)malloc(sizeof(FlowElement));
+							if (fe1->next == NULL)
+								return -1;
+							fe1->next->next = NULL;
+							fe1->next->prev = fe1;
+							fe1->next->type = Inner;
+							fe1->next->position.x = x;
+							fe1->next->position.y = i;
+							fe1 = fe1->next;
+							innerFlowElementCount++;
+						}
+						else
+						{
+							for(fe2 = fe1->prev; fe2->next->type != End; fe2 = fe2->prev);
+							//flow completed
+							if(fe2->position.x == x && fe2->position.y == i)
+							{
+								fe1->next = fe2;
+								fe2->prev = fe1;
+								levels[currentLevelIndex].completedFlowCount++;
+								return 0;
+							}
+							break;
+						}
+					}
+				}
+				//horizontal line
+				else if (fe1->position.y == y)
+				{
+					j = fe1->position.x < x ? 1 : -1;
+					for (i = fe1->position.x + j; i-j != x; i += j)
+					{
+						if(RemoveFlowElement(i, y, 1))
+						{
+							fe1->next = (FlowElement *)malloc(sizeof(FlowElement));
+							if (fe1->next == NULL)
+								return -1;
+							fe1->next->next = NULL;
+							fe1->next->prev = fe1;
+							fe1->next->type = Inner;
+							fe1->next->position.x = i;
+							fe1->next->position.y = y;
+							fe1 = fe1->next;
+							innerFlowElementCount++;
+						}
+						else
+						{
+							for(fe2 = fe1->prev; fe2->next->type != End; fe2 = fe2->prev);
+							//Flow completed
+							if(fe2->position.x == i && fe2->position.y == y)
+							{
+								fe1->next = fe2;
+								fe2->prev = fe1;
+								levels[currentLevelIndex].completedFlowCount++;
+								return 0;
+							}
+							break;
+						}
+					}
+				}
+			}
+			//remove FLowElements from the other end of the Flow
+			for(fe1 = flowElementStart; fe1->prev != NULL; fe1 = fe1->prev);
+			for(fe1 = fe1->next; fe1->prev->type != End; fe1 = fe1->next)
+			{
+				free(fe1->prev);
+				fe1->prev = NULL;
+				innerFlowElementCount--;
+			}
+		}
+		//starts from the last
+		else if (fe1->next->type == End)
+		{
+			//remove following FLowElements
+			//while not reached End or the mouse pos
+			for(fe1 = flowElementStart; fe1->prev != NULL; fe1 = fe1->prev);
+			for(; fe1->type != End && (fe1->position.x != x || fe1->position.y != y); fe1 = fe1->next);
+			//reached the end -> xy not on the flow
+			if (fe1->type != End || (fe1->position.x == x && fe1->position.y == y))
+			{
+				fe2 = fe1;
+				for(; fe1->prev != NULL; fe1 = fe1->prev);
+				for(fe1 = fe1->next; fe1->prev != fe2; fe1 = fe1->next)
+				{
+					if (fe1->prev== flowElementStart)
+						flowElementStart = fe2;
+					free(fe1->prev);
+					fe1->prev = NULL;
+					innerFlowElementCount--;
+				}
+			}
+			//add new FLowElements
+			if (flowElementStart->position.x != x || flowElementStart->position.y != y)
+			{
+				for(fe1 = flowElementStart; fe1->prev != NULL; fe1 = fe1->prev);
+				//vertical line
+				if (fe1->position.x == x)
+				{
+					j = fe1->position.y < y ? 1 : -1;
+					for (i = fe1->position.y + j; i-j != y; i += j)
+					{
+						if(RemoveFlowElement(x, i, 1))
+						{
+							fe1->prev = (FlowElement *)malloc(sizeof(FlowElement));
+							if (fe1->prev == NULL)
+								return -1;
+							fe1->prev->prev = NULL;
+							fe1->prev->next = fe1;
+							fe1->prev->type = Inner;
+							fe1->prev->position.x = x;
+							fe1->prev->position.y = i;
+							fe1 = fe1->prev;
+							innerFlowElementCount++;
+						}
+						else
+						{
+							for(fe2 = fe1->next; fe2->prev->type != End; fe2 = fe2->next);
+							//flow completed
+							if(fe2->position.x == x && fe2->position.y == i)
+							{
+								fe1->prev = fe2;
+								fe2->next = fe1;
+								levels[currentLevelIndex].completedFlowCount++;
+								return 0;
+							}
+							break;
+						}
+					}
+
+				}
+				//horizontal line
+				else if (fe1->position.y == y)
+				{
+					j = fe1->position.x < x ? 1 : -1;
+					for (i = fe1->position.x + j; i-j != x; i += j)
+					{
+						if(RemoveFlowElement(i, y, 1))
+						{
+							fe1->prev = (FlowElement *)malloc(sizeof(FlowElement));
+							if (fe1->prev == NULL)
+								return -1;
+							fe1->prev->prev = NULL;
+							fe1->prev->next = fe1;
+							fe1->prev->type = Inner;
+							fe1->prev->position.x = i;
+							fe1->prev->position.y = y;
+							fe1 = fe1->prev;
+							innerFlowElementCount++;
+						}
+						else
+						{
+							for(fe2 = fe1->next; fe2->prev->type != End; fe2 = fe2->next);
+							//flow completed
+							if(fe2->position.x == i && fe2->position.y == y)
+							{
+								fe1->prev = fe2;
+								fe2->next = fe1;
+								levels[currentLevelIndex].completedFlowCount++;
+								return 0;
+							}
+							break;
+						}
+					}
+				}
+			}
+			//remove FLowElements from the other end of the Flow
+			for(fe1 = flowElementStart; fe1->next != NULL; fe1 = fe1->next);
+			for(fe1 = fe1->prev; fe1->next->type != End; fe1 = fe1->prev)
+			{
+				free(fe1->next);
+				fe1->next = NULL;
+				innerFlowElementCount--;
+			}
+		}
+	}
+	return 0;
+}
+
+int InRect(Vector levelTemp, int w, int h, Vector b)
+{
+	return b.x >= levelTemp.x && b.x < levelTemp.x + w	&& b.y >= levelTemp.y && b.y < levelTemp.y + h;
+}
+
+void MakeConnection(FlowElement *from, FlowElement *to)
+{
+	if (from->position.x > to->position.x)
+	{
+		to->shape = (FlowElementShape)(to->shape | RightS);
+	}
+	else if(from->position.x < to->position.x)
+	{
+		to->shape = (FlowElementShape)(to->shape | LeftS);
+	}
+	else if (from->position.y > to->position.y)
+	{
+		to->shape = (FlowElementShape)(to->shape | DownS);
+	}
+	else
+	{
+		to->shape = (FlowElementShape)(to->shape | UpS);
+	}
+}
+
+/// <summary>
+/// Sets the FlowElement shapes to visulize connnections
+/// </summary>
+void SetShapes()
+{
+	Flow * f;
+	FlowElement *feA, *feB;
+	for (f = levels[currentLevelIndex].flowRoot; f != NULL; f = f->next)
+	{
+		for (feA = f->flowElementRoot; feA->prev != NULL && feA->prev != f->flowElementRoot; feA = feA->prev);
+		feB = feA;
+		for (; feA != NULL; feA = feA->next)
+		{
+			feA->shape = feA->type == End ? EndS : None;
+			if (feA->next != NULL)
+			{
+				if(feA->next->type != End || feA->type == Inner)
+					MakeConnection(feA->next, feA);
+			}
+			if (feA->prev != NULL)
+			{
+				if(feA->prev->type != End || feA->type == Inner)
+					MakeConnection(feA->prev, feA);
+			}
+			if (feA == feB->prev)
+				break; //circular
+		}
+	}
+}
+
+void RemoveAllFlowElements(Flow *f)
+{
+	FlowElement *feA;
+	int circular = 0;
+	for (feA = f->flowElementRoot; feA->next != NULL; feA = feA->next)
+	{
+		if (feA->next == f->flowElementRoot)
+		{
+			circular = 1;
+			break;
+		}
+	}
+	if (circular)
+	{
+		for (feA = f->flowElementRoot->next->next; feA->prev->type != End; feA = feA->next)
+		{
+			free(feA->prev);
+			feA->prev = NULL;
+		}
+		f->flowElementRoot->next = NULL;
+	}
+	else
+	{
+		if (f->flowElementRoot->next != NULL)
+		{
+			for(; feA->next != NULL; feA = feA->next);
+			for(feA = feA->prev; feA->next->type != End; feA = feA->prev)
+			{
+				free(feA->next);
+				feA->next = NULL;
+			}
+		}
+		else
+		{
+			for(; feA->prev != NULL; feA = feA->prev);
+			for(feA = feA->next; feA->prev->type != End; feA = feA->next)
+			{
+				free(feA->prev);
+				feA->prev = NULL;
+			}
+		}
+	}
+}
+
+void SetCurrentLevel(int levelIndex)
+{
+	Flow *f;
+	if (currentLevelCount > 1)
+	{
+		if (levelIndex > currentLevelCount - 1)
+			levelIndex = currentLevelCount - 1;
+		else if (levelIndex < 0)
+			levelIndex = 0;
+	}
+	else
+		return;
+	currentLevelIndex = levelIndex;
+	innerFlowElementCount = 0;
+	levels[currentLevelIndex].completedFlowCount = 0;
+	//reset level
+	for (f = levels[levelIndex].flowRoot; f != NULL; f = f->next)
+	{
+		RemoveAllFlowElements(f);
+	}
+	SetShapes();
+}
+
+void ProcessEvents()
+{
+	SDL_Event event;
+	while (SDL_PollEvent(&event))
+	{
+		switch (event.type)
+		{
+		case SDL_QUIT:
+			exiting = 1;
+			break;
+		case SDL_KEYDOWN:
+			KeysDown[event.key.keysym.sym] = 1;
+			break;
+		case SDL_KEYUP:
+			KeysDown[event.key.keysym.sym] = 0;
+			break;
+		case SDL_MOUSEMOTION:
+			mousePositionDown.x = event.motion.x;
+			mousePositionDown.y = event.motion.y;
+			break;
+		case SDL_MOUSEBUTTONDOWN:
+			if (event.button.button == 1)
+				LMB = JustDown;
+			break;
+		case SDL_MOUSEBUTTONUP:
+			if (event.button.button == 1)
+				LMB = JustUp;
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+void Draw();
+
+int Update()
+{
+	int i, j, textW, textH, margin;
+	Vector v;
+	Flow *f1, *f2;
+	FlowElement *fElem1, *fEleB;
+	FILE *file = NULL;
+	switch (gameState)
+	{
+#pragma region zart2
+	case MainMenu:
+		v.y = MAINMENU_ITEM_MARGIN;
+		for (i = 0; i < sizeof(mainMenuItems)/sizeof(MenuItem); i++)
+		{
+			TTF_SizeText(fontNormal, mainMenuItems[i].name, &textW, &textH);
+			v.x = (screen->w - textW) / 2;
+			if (InRect(v, textW, textH, mousePositionDown))
+			{
+				mainMenuItems[i].mouseOver = 1;
+				if(LMB == JustDown)
+					mainMenuItems[i].mouseDown = 1;
+				else if(LMB == JustUp && mainMenuItems[i].mouseDown)
+				{
+					gameState = mainMenuItems[i].gameState;
+					mainMenuItems[i].mouseDown = 0;
+					Update();
+				}
+			}
+			else
+			{
+				mainMenuItems[i].mouseOver = 0;
+				mainMenuItems[i].mouseDown = 0;
+			}
+			v.y += textH;
+		}
+		break;
+
+	case LevelSelectMenu:
+		//Back button
+		levels = defaultLevels;
+		currentLevelCount = defaultLevelCount;
+		arrowBack.gameState = MainMenu;
+		arrowNext.position.y = LEVEL_TILE_MARGIN_TOP + 3*LEVEL_TILE_SIZE + 2*LEVEL_TILE_PADDING + 20;
+		arrowPrev.position.y = arrowNext.position.y;
+		menuButton.gameState = LevelSelectMenu;
+		if (InRect(arrowBack.position, leftArrowPic->w, leftArrowPic->h, mousePositionDown))
+			if(LMB == JustUp)
+			{
+				gameState = arrowBack.gameState;
+				arrowBack.picture = leftArrowPic;
+			}
+			else
+				arrowBack.picture = leftArrowSelectedPic;
+		else
+			arrowBack.picture = leftArrowPic;
+		if (InRect(arrowPrev.position, leftArrowPic->w, leftArrowPic->h, mousePositionDown) &&
+			currentLevelSelectPage > 0)
+			if(LMB == JustUp)
+				currentLevelSelectPage--;
+			else
+				arrowPrev.picture = leftArrowSelectedPic;
+		else
+			arrowPrev.picture = leftArrowPic;
+		if (InRect(arrowNext.position, rightArrowPic->w, rightArrowPic->h, mousePositionDown) &&
+			currentLevelSelectPage < levelSelectPageCount - 1)
+			if(LMB == JustUp)
+				currentLevelSelectPage++;
+			else
+				arrowNext.picture = rightArrowSelectedPic;
+		else
+			arrowNext.picture = rightArrowPic;
+		//Tiles
+		margin = (screen->w-(3*LEVEL_TILE_SIZE+LEVEL_TILE_PADDING*2))/2;
+		v.y = LEVEL_TILE_MARGIN_TOP;
+		for (i = 0; i < 3; i++)
+		{
+			v.x = margin;
+			for (j = 0; j < 3; j++)
+			{
+				if (InRect(v, LEVEL_TILE_SIZE, LEVEL_TILE_SIZE, mousePositionDown))
+				{
+					if(LMB == JustDown)
+						levelTiles[i*3+j].mouseDown = 1;
+					else
+					{
+						if(LMB == JustUp && levelTiles[i*3+j].mouseDown)
+						{
+							SetCurrentLevel(i*3+j+currentLevelSelectPage*9);
+							gameState = ActiveGame;
+							Update();
+							arrowBack.gameState = LevelSelectMenu;
+							levelTiles[i*3+j].mouseDown = 0;
+						}
+					}
+				}
+				else
+					levelTiles[i*3+j].mouseDown = 0;
+				v.x += LEVEL_TILE_SIZE+LEVEL_TILE_PADDING;
+			}
+			v.y += LEVEL_TILE_SIZE+LEVEL_TILE_PADDING;
+		}
+		break;
+
+	case ActiveGame:
+		arrowNext.position.y = LEVEL_TILE_MARGIN_TOP + 3*LEVEL_TILE_SIZE + 2*LEVEL_TILE_PADDING + 20;
+		arrowPrev.position.y = arrowNext.position.y;
+		reload.position.y = arrowNext.position.y;
+		reload.position.x = screen->w / 2 - reload.picture->w / 2;
+		//back button
+		if (InRect(arrowBack.position, leftArrowPic->w, leftArrowPic->h, mousePositionDown))
+			if(LMB == JustUp)
+				gameState = arrowBack.gameState;
+			else
+				arrowBack.picture = leftArrowSelectedPic;
+		else
+			arrowBack.picture = leftArrowPic;
+		if (!isTimeTrialGame)
+		{
+			//next level button
+			if (InRect(arrowNext.position, rightArrowPic->w, rightArrowPic->h, mousePositionDown) && currentLevelIndex != currentLevelCount-1)
+				if(LMB == JustUp)
+				{
+					SetCurrentLevel(currentLevelIndex + 1);
+					currentLevelSelectPage = (currentLevelIndex + 1) / 9;
+				}
+				else
+					arrowNext.picture = rightArrowSelectedPic;
+			else
+				arrowNext.picture = rightArrowPic;
+			//previous level button
+			if (InRect(arrowPrev.position, leftArrowPic->w, leftArrowPic->h, mousePositionDown) && currentLevelIndex > 0)
+				if(LMB == JustUp)
+				{
+					SetCurrentLevel(currentLevelIndex - 1);
+					currentLevelSelectPage = (currentLevelIndex + 1) / 9;
+				}
+				else
+					arrowPrev.picture = leftArrowSelectedPic;
+			else
+				arrowPrev.picture = leftArrowPic;
+		}
+		else
+		{
+			if (SDL_GetTicks() - 1000 > currentTime)
+			{
+				currentTime = SDL_GetTicks();
+				if (--currentTimeTTime == 0)
+				{
+					gameState = GameOver;
+					menuButton.gameState = TimeTrialMenu;
+					Update();
+				}
+			}
+		}
+		//reload level button
+		if (InRect(reload.position, reloadPic->w, reloadPic->h, mousePositionDown))
+			if(LMB == JustUp)
+			{
+				SetCurrentLevel(currentLevelIndex);
+				reload.picture = reloadPic;
+			}
+			else
+				reload.picture = reloadSelectedPic;
+		else
+			reload.picture = reloadPic;
+		margin = (screen->w - GAME_AREA_SIZE) / 2;
+		v.x = margin;
+		v.y = LEVEL_TILE_MARGIN_TOP;
+		//get clicked flow element
+		if(LMB == JustDown)
+		{
+			flowElementStart = NULL;
+			for (f1 = levels[currentLevelIndex].flowRoot; f1 != NULL; f1 = f1->next)
+			{
+				for (fElem1 = f1->flowElementRoot; fElem1->prev != NULL &&
+					fElem1->prev != f1->flowElementRoot; fElem1 = fElem1->prev);
+					fEleB = fElem1;
+				for (; fElem1 != NULL; fElem1 = fElem1->next)
+				{
+					i = GAME_AREA_SIZE / levels[currentLevelIndex].size;
+					v.x = fElem1->position.x * i + margin;
+					v.y = fElem1->position.y * i + LEVEL_TILE_MARGIN_TOP;
+					if(InRect(v, i, i, mousePositionDown))
+					{
+						flowElementStart = fElem1;
+						break;
+					}
+					if (fElem1 == fEleB->prev)
+						break;
+				}
+			}
+		}
+		else if (LMB == Down && InRect(v, GAME_AREA_SIZE, GAME_AREA_SIZE, mousePositionDown))
+		{
+			//convert mouse position to FlowElement posisiton
+			v.x = (double)(mousePositionDown.x - margin) / ((double)GAME_AREA_SIZE / levels[currentLevelIndex].size);
+			v.y = (double)(mousePositionDown.y - LEVEL_TILE_MARGIN_TOP - 1) / ((double)GAME_AREA_SIZE / levels[currentLevelIndex].size);
+			//connect FlowElements
+			if (MakeRoute(v.x, v.y) == -1)
+				return -1; //memory error
+			SetShapes();
+			//check if game is over
+			if (levels[currentLevelIndex].flowCount == levels[currentLevelIndex].completedFlowCount)
+			{
+				if (innerFlowElementCount + levels[currentLevelIndex].flowCount*2 ==
+					levels[currentLevelIndex].size * levels[currentLevelIndex].size)
+					levels[currentLevelIndex].state = Starred;
+				else if (levels[currentLevelIndex].state != Starred)
+					levels[currentLevelIndex].state = Completed;
+				LMB = Up;
+				Draw(); //draw the last connection
+				if (isTimeTrialGame)
+				{
+					currentTimeTScore++;
+					SetCurrentLevel(rand() % defaultLevelCount);
+				}
+				else
+				{
+					gameState = GameOver;
+					Update();
+					screenBlurred = 0;
+				}
+			}
+		}
+		break;
+
+	case GameOver:
+		reload.position.y = 300;
+		reload.position.x = screen->w / 2 - (int)(leftArrowPic->w * 0.5) - LEVEL_CHANGE_ARROW_DIST;
+		arrowNext.position.y = 300;
+		if (!isTimeTrialGame)
+		{
+			//reload level button
+			if (InRect(reload.position, reloadPic->w, reloadPic->h, mousePositionDown) && levels[currentLevelIndex].state != Starred)
+				if(LMB == JustUp)
+				{
+					SetCurrentLevel(currentLevelIndex);
+					gameState = reload.gameState;
+					reload.picture = reloadPic;
+				}
+				else
+					reload.picture = reloadSelectedPic;
+			else
+				reload.picture = reloadPic;
+			//next level button
+			if (InRect(arrowNext.position, rightArrowPic->w, rightArrowPic->h, mousePositionDown) && currentLevelIndex != currentLevelCount-1)
+				if(LMB == JustUp)
+				{
+					SetCurrentLevel(currentLevelIndex + 1);
+					currentLevelSelectPage = (currentLevelIndex + 1) / 9;
+					gameState = arrowNext.gameState;
+					arrowNext.picture = rightArrowPic;
+					Update();
+				}
+				else
+					arrowNext.picture = rightArrowSelectedPic;
+			else
+				arrowNext.picture = rightArrowPic;
+		}
+		else
+		{
+			if (timeTHighScores[timeTScoreIndex] < currentTimeTScore)
+			{
+				timeTHighScores[timeTScoreIndex] = currentTimeTScore;
+			}
+		}
+		//back to menu button
+		if (InRect(menuButton.position, menuPic->w, menuPic->h, mousePositionDown))
+			if(LMB == JustUp)
+			{
+				gameState = menuButton.gameState;
+				menuButton.picture = menuPic;
+			}
+			else
+				menuButton.picture = menuSelectedPic;
+		else
+			menuButton.picture = menuPic;
+		break;
+#pragma endregion zart2
+
+	case TimeTrialMenu:
+		levels = defaultLevels;
+		arrowBack.gameState = MainMenu;
+		isTimeTrialGame = 0;
+		//Back button
+		if (InRect(arrowBack.position, leftArrowPic->w, leftArrowPic->h, mousePositionDown))
+			if(LMB == JustUp)
+				gameState = arrowBack.gameState;
+			else
+				arrowBack.picture = leftArrowSelectedPic;
+		else
+			arrowBack.picture = leftArrowPic;
+		v.y = MAINMENU_ITEM_MARGIN;
+		v.x = TIME_TRIAL_MARGIN;
+		for (i = 0; i < sizeof(timeTrialMenuItems)/sizeof(TimeTrialMenuItem); i++)
+		{
+			TTF_SizeText(fontNormal, timeTrialMenuItems[i].name, &textW, &textH);
+			if (InRect(v, textW, textH, mousePositionDown))
+			{
+				timeTrialMenuItems[i].mouseOver = 1;
+				if(LMB == JustDown)
+					timeTrialMenuItems[i].mouseDown = 1;
+				else if(LMB == JustUp && timeTrialMenuItems[i].mouseDown)
+				{
+					gameState = ActiveGame;
+					timeTrialMenuItems[i].mouseDown = 0;
+					timeTrialMenuItems[i].mouseOver = 0;
+					currentTimeTTime = timeTrialMenuItems[i].time + 1;
+					timeTScoreIndex =timeTrialMenuItems[i].index;
+					isTimeTrialGame = 1;
+					currentTimeTScore = 0;
+					SetCurrentLevel(rand() % defaultLevelCount);
+					arrowBack.gameState = TimeTrialMenu;
+					Update();
+				}
+			}
+			else
+			{
+				timeTrialMenuItems[i].mouseDown = 0;
+				timeTrialMenuItems[i].mouseOver = 0;
+			}
+			v.y += textH;
+		}
+		break;
+
+	case UserLevelLoading:
+		if (loadUserLevel)
+		{
+			loadUserLevel = 0;
+			menuButton.gameState = MainMenu;
+			arrowBack.gameState = MainMenu;
+			if ((file = fopen("userLevels.txt", "rt")) == NULL)
+				userLevelError = "\"userLevels.txt\" could not be loaded.";
+			else
+			{
+				if (userLevels != NULL) //free previously loaded levels
+				{
+					for (i = 0; i < userLevelCount; i++)
+					{
+						for (f1 = userLevels[i].flowRoot; f1 != NULL; )
+						{
+							RemoveAllFlowElements(f1);
+							free(f1->flowElementRoot->prev);
+							free(f1->flowElementRoot);
+							f2 = f1;
+							f1 = f1->next;
+							free(f2);
+						}
+					}
+					free(userLevels);
+				}
+				if ((userLevels = LoadLevels(file, &userLevelCount)) == NULL)
+					userLevelError = "\"userLevels.txt\" contains wrong format.";
+				else
+				{
+					levels = userLevels;
+					currentLevelCount = userLevelCount;
+					SetCurrentLevel(0);
+					loadUserLevel = 1;
+					gameState = ActiveGame;
+					Update();
+				}
+				fclose(file);
+			}
+			screenBlurred = 0;
+		}
+		//back to menu button
+		if (InRect(menuButton.position, menuPic->w, menuPic->h, mousePositionDown))
+			if(LMB == JustUp)
+			{
+				gameState = menuButton.gameState;
+				menuButton.picture = menuPic;
+				loadUserLevel = 1;
+			}
+			else
+				menuButton.picture = menuSelectedPic;
+		else
+			menuButton.picture = menuPic;
+		break;
+
+	case AboutMenu:
+		//Back button
+		if (InRect(arrowBack.position, leftArrowPic->w, leftArrowPic->h, mousePositionDown))
+			if(LMB == JustUp)
+				gameState = arrowBack.gameState;
+			else
+				arrowBack.picture = leftArrowSelectedPic;
+		else
+			arrowBack.picture = leftArrowPic;
+		break;
+
+	case Exit:
+		exiting = 1;
+		break;
+	}
+	switch (LMB)
+	{
+	case JustUp:
+		LMB = Up;
+		break;
+	case JustDown:
+		LMB = Down;
+		break;
+	default:
+		break;
+	}
+	if (KeysDown[SDLK_UP])
+		t.y -= 3;
+	if (KeysDown[SDLK_RIGHT])
+		t.x += 3;
+	if (KeysDown[SDLK_DOWN])
+		t.y += 3;
+	if (KeysDown[SDLK_LEFT])
+		t.x -=3;
+	if (KeysDown[SDLK_ESCAPE])
+		exiting = 1;
+	return 0;
+}
+
+void Draw()
+{
+	SDL_Color white = {255,255,255};
+	SDL_Color black = {0,0,0};
+	char str1[60], str2[60];
+	int i, j, textW, textH, margin;
+	SDL_Rect r = {0, 0, 0, 0};
+	Flow *f;
+	FlowElement *fElem1, *fElem2;
+	SDL_Surface *surface;
+	switch (gameState)
+	{
+#pragma region zart
+	case MainMenu:
+		ClearSurface(screen, SDL_MapRGB(screen->format, 0, 0, 0));
+		TTF_SizeText(fontTitle,"flow", &textW, NULL);
+		r.x = (screen->w - textW) / 2;
+		PrintString(screen, r, fontTitle, "flow", white, black);
+		r.y = MAINMENU_ITEM_MARGIN;
+		for (i = 0; i < sizeof(mainMenuItems)/sizeof(MenuItem); i++)
+		{
+			TTF_SizeText(fontNormal, mainMenuItems[i].name, &textW, &textH);
+			r.x = (screen->w - textW) / 2;
+			if (mainMenuItems[i].mouseOver)
+			{
+				if (mainMenuItems[i].mouseDown)
+					PrintString(screen, r, fontNormal, mainMenuItems[i].name, Darken(mainMenuItems[i].color, 0.3), mainMenuItems[i].color);
+				else
+					PrintString(screen, r, fontNormal, mainMenuItems[i].name, Darken(mainMenuItems[i].color, 0.3), black);
+			}
+			else
+				PrintString(screen, r, fontNormal, mainMenuItems[i].name, mainMenuItems[i].color, black);
+			r.y += textH;
+		}
+		break;
+
+	case LevelSelectMenu:
+		ClearSurface(screen, SDL_MapRGB(screen->format, 0, 0, 0));
+		r.x = arrowBack.position.x;
+		r.y = arrowBack.position.y;
+		SDL_BlitSurface(arrowBack.picture, 0, screen, &r);
+		if (currentLevelSelectPage > 0)
+		{
+			r.x = arrowPrev.position.x;
+			r.y = arrowPrev.position.y;
+			SDL_BlitSurface(arrowPrev.picture, 0, screen, &r);
+		}
+		if (currentLevelSelectPage < levelSelectPageCount - 1)
+		{
+			r.x = arrowNext.position.x;
+			r.y = arrowNext.position.y;
+			SDL_BlitSurface(arrowNext.picture, 0, screen, &r);
+		}
+
+		//current/all LevelTile page
+		*str1 = 0;
+		_itoa(currentLevelSelectPage+1, str2, 10);
+		strcat(str1, str2);
+		strcat(str1, "/");
+		_itoa(levelSelectPageCount, str2, 10);
+		strcat(str1, str2);
+		TTF_SizeText(fontSmall, str1, &textW, NULL);
+		r.x = screen->w/2-textW/2;
+		r.y = LEVEL_TILE_MARGIN_TOP - 30;
+		PrintString(screen, r, fontSmall, str1, white, black);
+
+		//Tiles
+		margin = (screen->w-(3*LEVEL_TILE_SIZE+LEVEL_TILE_PADDING*2))/2;
+		r.y = LEVEL_TILE_MARGIN_TOP;
+		for (i = 0; i < 3; i++)
+		{
+			r.x = margin;
+			for (j = 0; j < 3; j++)
+			{
+				itoa(i*3+j+1+currentLevelSelectPage*9, str1, 10);
+				TTF_SizeText(fontNormal, str1, &textW, &textH);
+				if (levelTiles[i*3+j].mouseDown)
+				{
+					boxColor(screen, r.x, r.y, r.x + LEVEL_TILE_SIZE, r.y + LEVEL_TILE_SIZE,
+						SDLColorTo32bit(Darken(LEVELTILE_COLOR, 0.3)));
+					r.x += (LEVEL_TILE_SIZE-textW)/2;
+					r.y += (LEVEL_TILE_SIZE-textH)/2;
+					PrintString(screen, r, fontNormal, str1, black, Darken(LEVELTILE_COLOR, 0.3));
+					r.x -= (LEVEL_TILE_SIZE-textW)/2;
+					r.y -= (LEVEL_TILE_SIZE-textH)/2;
+				}
+				else
+				{
+					boxColor(screen, r.x, r.y, r.x + LEVEL_TILE_SIZE, r.y + LEVEL_TILE_SIZE,
+						SDLColorTo32bit(LEVELTILE_COLOR));
+					r.x += (LEVEL_TILE_SIZE-textW)/2;
+					r.y += (LEVEL_TILE_SIZE-textH)/2;
+					PrintString(screen, r, fontNormal, str1, black, LEVELTILE_COLOR);
+					r.x -= (LEVEL_TILE_SIZE-textW)/2;
+					r.y -= (LEVEL_TILE_SIZE-textH)/2;
+				}
+				if (i*3+j+currentLevelSelectPage*9 < currentLevelCount)
+				{
+					r.x += LEVEL_TILE_SIZE - cMarkPic->w-5;
+					r.y += LEVEL_TILE_SIZE - cMarkPic->h-5;
+					switch (levels[i*3+j+currentLevelSelectPage*9].state)
+					{
+					case Completed:
+						SDL_BlitSurface(cMarkPic, 0, screen, &r);
+						break;
+					case Starred:
+						SDL_BlitSurface(starPic, 0, screen, &r);
+						break;
+					default:
+						break;
+					}
+					r.y -= LEVEL_TILE_SIZE - cMarkPic->h-5;
+					r.x -= LEVEL_TILE_SIZE - cMarkPic->w-5;
+				}
+				r.x += LEVEL_TILE_SIZE + LEVEL_TILE_PADDING;
+			}
+			r.y += LEVEL_TILE_SIZE + LEVEL_TILE_PADDING;
+		}
+		r.x = 50;
+		r.y = 0;
+		PrintString(screen, r, fontNormal, "choose level", white, black);
+		break;
+
+	case ActiveGame:
+		ClearSurface(screen, SDL_MapRGB(screen->format, 0, 0, 0));
+		//back button
+		r.x = arrowBack.position.x;
+		r.y = arrowBack.position.y;
+		SDL_BlitSurface(arrowBack.picture, 0, screen, &r);
+		if (!isTimeTrialGame)
+		{
+			//previous level button
+			if (currentLevelIndex > 0)
+			{
+				r.x = arrowPrev.position.x;
+				r.y = arrowPrev.position.y;
+				SDL_BlitSurface(arrowPrev.picture, 0, screen, &r);
+			}
+			//next level button
+			if (currentLevelIndex != currentLevelCount-1)
+			{
+				r.x = arrowNext.position.x;
+				r.y = arrowNext.position.y;
+				SDL_BlitSurface(arrowNext.picture, 0, screen, &r);
+			}
+		}
+		else
+		{
+			//time left
+			*str1 = 0;
+			_itoa(currentTimeTTime, str1, 10);
+			TTF_SizeText(fontSmall, str1, &textW, &textH);
+			r.x = (screen->w + GAME_AREA_SIZE) / 2 - 20;
+			r.y = LEVEL_TILE_MARGIN_TOP - textH - 10;
+			PrintString(screen, r, fontSmall, str1, white, black);
+			//current score
+			*str1 = 0;
+			strcat(str1, "completed: ");
+			_itoa(currentTimeTScore, str2, 10);
+			strcat(str1, str2);
+			TTF_SizeText(fontSmall, str1, &textW, &textH);
+			r.x = (screen->w + textW) / 2;
+			r.y = LEVEL_TILE_MARGIN_TOP - textH - 10;
+			PrintString(screen, r, fontSmall, str1, white, black);
+		}
+		//reload level button
+		r.x = reload.position.x;
+		r.y = reload.position.y;
+		SDL_BlitSurface(reload.picture, 0, screen, &r);
+		margin = (screen->w - GAME_AREA_SIZE)/2;
+		//comleted/all flow count
+		*str1 = 0;
+		strcat(str1, "flows: ");
+		_itoa(levels[currentLevelIndex].completedFlowCount, str2, 10);
+		strcat(str1, str2);
+		strcat(str1, "/");
+		_itoa(levels[currentLevelIndex].flowCount, str2, 10);
+		strcat(str1, str2);
+		TTF_SizeText(fontSmall, str1, &textW, &textH);
+		r.x = margin;
+		r.y = LEVEL_TILE_MARGIN_TOP - textH - 10;
+		PrintString(screen, r, fontSmall, str1, white, black);
+		//percent
+		*str1 = 0;
+		_itoa((int)((double)(innerFlowElementCount + levels[currentLevelIndex].completedFlowCount) *
+			100 / (levels[currentLevelIndex].size * levels[currentLevelIndex].size +
+			levels[currentLevelIndex].flowCount - levels[currentLevelIndex].flowCount*2)), str1, 10);
+		strcat(str1, "%");
+		r.x = margin + 100;
+		r.y = LEVEL_TILE_MARGIN_TOP - textH - 10;
+		PrintString(screen, r, fontSmall, str1, white, black);
+		//level state
+		r.x = screen->w - cMarkPic->w - 10;
+		r.y = 30;
+		switch (levels[currentLevelIndex].state)
+		{
+		case Completed:
+			SDL_BlitSurface(cMarkPic, 0, screen, &r);
+			break;
+		case Starred:
+			SDL_BlitSurface(starPic, 0, screen, &r);
+			break;
+		default:
+			break;
+		}
+		//horizontal grid
+		for (i = 0; i <= levels[currentLevelIndex].size; i++)
+		{
+			r.x = margin-GAME_AREA_GRID_WIDTH;
+			r.w = GAME_AREA_GRID_WIDTH + levels[currentLevelIndex].size*
+				((GAME_AREA_SIZE-(levels[currentLevelIndex].size-1)*
+				GAME_AREA_GRID_WIDTH)/levels[currentLevelIndex].size + GAME_AREA_GRID_WIDTH) - 1;
+			r.y = LEVEL_TILE_MARGIN_TOP-GAME_AREA_GRID_WIDTH +
+				i*((GAME_AREA_SIZE-(levels[currentLevelIndex].size-1)*
+				GAME_AREA_GRID_WIDTH)/levels[currentLevelIndex].size + GAME_AREA_GRID_WIDTH);
+			r.h = GAME_AREA_GRID_WIDTH-1;
+			boxColor(screen, r.x, r.y, r.x + r.w, r.y + r.h, SDLColorTo32bit(GAME_AREA_GRID_COLOR));
+		}
+		//vertical grid
+		for (i = 0; i <= levels[currentLevelIndex].size; i++)
+		{
+			r.x = margin-GAME_AREA_GRID_WIDTH +
+				i*((GAME_AREA_SIZE-(levels[currentLevelIndex].size-1) *
+				GAME_AREA_GRID_WIDTH)/levels[currentLevelIndex].size + GAME_AREA_GRID_WIDTH);
+			r.w = GAME_AREA_GRID_WIDTH-1;
+			r.y = LEVEL_TILE_MARGIN_TOP - GAME_AREA_GRID_WIDTH;
+			r.h = GAME_AREA_SIZE + GAME_AREA_GRID_WIDTH - 1;
+			boxColor(screen, r.x, r.y, r.x + r.w, r.y + r.h, SDLColorTo32bit(GAME_AREA_GRID_COLOR));
+		}
+		//Flows
+		r.w = (GAME_AREA_SIZE-(levels[currentLevelIndex].size-1)*GAME_AREA_GRID_WIDTH)/levels[currentLevelIndex].size-1;
+		r.h = r.w;
+		i = r.w*FLOW_WIDTH_PERCENT/100.0; //current flow width
+		j = r.w*FLOW_END_WITDH_PERCENT/100.0; //current flow end width
+		for (f = levels[currentLevelIndex].flowRoot; f != NULL; f = f->next)
+		{
+			//FlowElements
+			for (fElem1 = f->flowElementRoot; fElem1->prev != NULL && fElem1->prev != f->flowElementRoot; fElem1 = fElem1->prev);
+			if (fElem1->prev != NULL)
+				fElem1 = fElem1->prev;
+			fElem2 = fElem1;
+			for (; fElem1 != NULL; fElem1 = fElem1->next)
+			{
+				r.x = fElem1->position.x*(r.w + GAME_AREA_GRID_WIDTH + 1) + margin;
+				r.y = fElem1->position.y*(r.w + GAME_AREA_GRID_WIDTH + 1) + LEVEL_TILE_MARGIN_TOP;
+				boxColor(screen, r.x, r.y, r.x + r.w, r.y + r.h, SetOpacity(SDLColorTo32bit(f->color), FLOW_BG_OPACITY));
+				if (fElem1->shape & UpS)
+				{
+					boxColor(screen, r.x+(r.w-i)/2, r.y, r.x+(r.w-i)/2+i,
+						r.y +(r.h-i)/2 + i, SDLColorTo32bit(f->color));
+				}
+				//overlap grid
+				if (fElem1->shape & DownS)
+				{
+					boxColor(screen, r.x+(r.w-i)/2, r.y + r.w + GAME_AREA_GRID_WIDTH,
+						r.x+(r.w-i)/2+i, r.y +(r.h-i)/2, SDLColorTo32bit(f->color));
+				}
+				//overlap grid
+				if (fElem1->shape & RightS)
+				{
+					boxColor(screen, r.x+(r.w-i)/2, r.y +(r.h-i)/2 + i,	r.x+r.w +
+						GAME_AREA_GRID_WIDTH, r.y +(r.h-i)/2, SDLColorTo32bit(f->color));
+				}
+				if (fElem1->shape & LeftS)
+				{
+					boxColor(screen, r.x, r.y +(r.h-i)/2, r.x+(r.w-i)/2+i,
+						r.y +(r.h-i)/2 + i, SDLColorTo32bit(f->color));
+				}
+				if (fElem1->shape & EndS)
+				{
+					boxColor(screen, r.x+(r.w-j)/2, r.y +(r.h-j)/2, r.x+
+						(r.w-j)/2+j, r.y +(r.h-j)/2 +
+						j, SDLColorTo32bit(f->color));
+				}
+				if (fElem1 == fElem2->prev)
+					break; //circular
+			}
+		}
+		rectangleColor(screen, margin, LEVEL_TILE_MARGIN_TOP, margin + GAME_AREA_SIZE, LEVEL_TILE_MARGIN_TOP + GAME_AREA_SIZE, 0xffffffff);
+		//print level name
+		*str1 = 0;
+		strcat(str1, "level ");
+		_itoa(levels[currentLevelIndex].name, str2, 10);
+		strcat(str1, str2);
+		r.x = 50;
+		r.y = 0;
+		PrintString(screen, r, fontNormal, str1, white, black);
+		break;
+
+	case GameOver:
+		//blur previous screen
+		if (!screenBlurred)
+		{
+			BlurH(screen, 2);
+			BlurW(screen, 2);
+			screenBlurred = 1;
+		}
+		if (!isTimeTrialGame)
+		{
+			if (levels[currentLevelIndex].state != Starred)
+			{
+				TTF_SizeText(fontSmall, "fill the whole game area.", &textW, &textH);
+				r.y = arrowNext.position.y-arrowNext.picture->h-textH;
+				r.x = screen->w/2 - textW/2;
+				PrintString(screen, r, fontSmall, "fill the whole game area.", white, black);
+				r.y -= textH;
+				TTF_SizeText(fontSmall, "If you want to get a star,", &textW, &textH);
+				r.x = screen->w/2 - textW/2;
+				PrintString(screen, r, fontSmall, "If you want to get a star,", white, black);
+				TTF_SizeText(fontNormal, "completed", &textW, &textH);
+				r.x = screen->w/2 - textW/2;
+				r.y -= textH;
+				PrintString(screen, r, fontNormal, "completed", white, black);
+				//reload level button
+				r.x = reload.position.x;
+				r.y = reload.position.y;
+				SDL_BlitSurface(reload.picture, 0, screen, &r);
+			}
+			else
+			{
+				TTF_SizeText(fontNormal, "completed", &textW, &textH);
+				r.x = screen->w/2 - textW/2;
+				r.y = arrowNext.position.y-arrowNext.picture->h-textH;
+				PrintString(screen, r, fontNormal, "completed", white, black);
+			}
+			if (currentLevelIndex != currentLevelCount-1)
+			{
+				r.x = arrowNext.position.x;
+				r.y = arrowNext.position.y;
+				SDL_BlitSurface(arrowNext.picture, 0, screen, &r);
+			}
+		}
+		else
+		{
+			TTF_SizeText(fontNormal, "game over", &textW, &textH);
+			r.x = (screen->w - textW) / 2;
+			r.y = arrowNext.position.y-arrowNext.picture->h-textH;
+			PrintString(screen, r, fontNormal, "game over", white, black);
+			//score
+			*str1 = 0;
+			strcat(str1, "you have made ");
+			_itoa(currentTimeTScore, str2, 10);
+			strcat(str1, str2);
+			strcat(str1, " levels");
+			TTF_SizeText(fontSmall, str1, &textW, NULL);
+			r.x = screen->w/2 - textW/2;
+			r.y += textH;
+			PrintString(screen, r, fontSmall, str1, white, black);
+		}
+		//back to menu button
+		r.x = menuButton.position.x;
+		r.y = menuButton.position.y;
+		SDL_BlitSurface(menuButton.picture, 0, screen, &r);
+		break;
+
+	case UserLevelLoading:
+		if (!screenBlurred)
+		{
+			BlurH(screen, 2);
+			BlurW(screen, 2);
+			screenBlurred = 1;
+		}
+		TTF_SizeText(fontSmall, userLevelError, &textW, &textH);
+		r.y = arrowNext.position.y-arrowNext.picture->h-textH;
+		r.x = screen->w/2 - textW/2;
+		PrintString(screen, r, fontSmall, userLevelError, white, black);
+		r.x = menuButton.position.x;
+		r.y = menuButton.position.y;
+		SDL_BlitSurface(menuButton.picture, 0, screen, &r);
+		break;
+#pragma endregion zart
+
+	case TimeTrialMenu:
+		ClearSurface(screen, SDL_MapRGB(screen->format, 0, 0, 0));
+		r.x = arrowBack.position.x;
+		r.y = arrowBack.position.y;
+		SDL_BlitSurface(arrowBack.picture, 0, screen, &r); r.x = 50;
+		r.y = 0;
+		PrintString(screen, r, fontNormal, "time trial", white, black);
+		r.y = MAINMENU_ITEM_MARGIN;
+		r.x = TIME_TRIAL_MARGIN;
+		for (i = 0; i < sizeof(timeTrialMenuItems)/sizeof(TimeTrialMenuItem); i++)
+		{
+			TTF_SizeText(fontNormal, timeTrialMenuItems[i].name, NULL, &textH);
+			if (timeTrialMenuItems[i].mouseOver)
+			{
+				if (timeTrialMenuItems[i].mouseDown)
+					PrintString(screen, r, fontNormal, timeTrialMenuItems[i].name,
+					Darken(timeTrialMenuItems[i].color, 0.3), timeTrialMenuItems[i].color);
+				else
+					PrintString(screen, r, fontNormal, timeTrialMenuItems[i].name,
+					Darken(timeTrialMenuItems[i].color, 0.3), black);
+			}
+			else
+				PrintString(screen, r, fontNormal, timeTrialMenuItems[i].name,
+				timeTrialMenuItems[i].color, black);
+			if (timeTHighScores[timeTrialMenuItems[i].index] != 0)
+			{
+				*str1 = 0;
+				_itoa(timeTHighScores[timeTrialMenuItems[i].index], str1, 10);
+				TTF_SizeText(fontNormal, str1, &textW, NULL);
+				r.x = screen->w - textW - TIME_TRIAL_MARGIN;
+				PrintString(screen, r, fontNormal, str1, white, black);
+				r.x = TIME_TRIAL_MARGIN;
+			}
+			r.y += textH;
+		}
+		break;
+
+	case AboutMenu:
+		ClearSurface(screen, SDL_MapRGB(screen->format, 0, 0, 0));
+		r.x = arrowBack.position.x;
+		r.y = arrowBack.position.y;
+		SDL_BlitSurface(arrowBack.picture, 0, screen, &r);
+		r.x = 50;
+		r.y = 0;
+		PrintString(screen, r, fontNormal, "about", white, black);
+		TTF_SizeText(fontNormal, "szabolevente", &textW, NULL);
+		r.x = screen->w / 2 - textW / 2;
+		r.y = 200;
+		aboutAnimation += 0xc3a3;
+		white.r = (aboutAnimation & 0xff0000) >> 16;
+		white.g = (aboutAnimation & 0xff00) >> 8;
+		white.b = (aboutAnimation & 0xff);
+		PrintString(screen, r, fontNormal, "szabolevente", white, black);
+		TTF_SizeText(fontNormal, "@mail.com", &textW, &textH);
+		r.x = screen->w / 2 - textW / 2;
+		r.y += textH;
+		PrintString(screen, r, fontNormal, "@mail.com", white, black);
+		white.r = 255;
+		white.g = 255;
+		white.b = 255;
+		break;
+	}
+	_itoa(t.x, str1, 10);
+	stringRGBA(screen, 0, 0, str1, 255, 255, 255, 255);
+	_itoa(t.y, str1, 10);
+	stringRGBA(screen, 0, 10, str1, 255, 255, 255, 255);
+	_itoa(levels[currentLevelIndex].flowCount, str1, 10);
+	stringRGBA(screen, 0, 20, str1, 255, 255, 255, 255);
+	SDL_Flip(screen);
+}
+
+int LoadResources()
+{
+	FILE *file;
+	if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) < 0)
+	{
+		printf( "Unable to init SDL: %s\n", SDL_GetError());
+		return -1;
+	}
+	atexit(SDL_Quit);
+	if(TTF_Init()==-1)
+	{
+		printf("Unable to init TTF: %s\n", TTF_GetError());
+		return -1;
+	}
+	atexit(TTF_Quit);
+	if ((screen = SDL_SetVideoMode(480, 640, 0, SDL_HWSURFACE|SDL_DOUBLEBUF)) == NULL)
+	{
+		printf("Unable to set 480x640 video: %s\n", SDL_GetError());
+		return 1;
+	}
+	if(IMG_Init(IMG_INIT_TIF | IMG_INIT_JPG | IMG_INIT_PNG) == 0)
+	{
+		printf("Failed to init required support!\n");
+	}
+	atexit(IMG_Quit);
+	if ((fontTitle = TTF_OpenFont("DunkinSans.ttf", FONTSIZE_BIG)) == NULL)
+	{
+		printf("Unable to open font.\n");
+		return -1;
+	}
+	if ((fontNormal = TTF_OpenFont("DunkinSans.ttf", FONTSIZE_NORMAL)) == NULL)
+	{
+		printf("Unable to open font.\n");
+		return -1;
+	}
+	if ((fontSmall = TTF_OpenFont("DunkinSans.ttf", FONTSIZE_SMALL)) == NULL)
+	{
+		printf("Unable to open font.\n");
+		return -1;
+	}
+	if ((leftArrowPic = IMG_Load("left_arrow.png")) == NULL)
+	{
+		printf("Unable to load bitmap: %s\n", SDL_GetError());
+		return -1;
+	}
+	if ((leftArrowSelectedPic = IMG_Load("left_arrow_clicked.png")) == NULL)
+	{
+		printf("Unable to load bitmap: %s\n", SDL_GetError());
+		return -1;
+	}
+	if ((starPic = IMG_Load("star.png")) == NULL)
+	{
+		printf("Unable to load bitmap: %s\n", SDL_GetError());
+		return -1;
+	}
+	if ((cMarkPic = IMG_Load("cMark.png")) == NULL)
+	{
+		printf("Unable to load bitmap: %s\n", SDL_GetError());
+		return -1;
+	}
+	if ((menuPic = IMG_Load("menu.png")) == NULL)
+	{
+		printf("Unable to load bitmap: %s\n", SDL_GetError());
+		return -1;
+	}
+	if ((menuSelectedPic = IMG_Load("menu_clicked.png")) == NULL)
+	{
+		printf("Unable to load bitmap: %s\n", SDL_GetError());
+		return -1;
+	}
+	if ((reloadPic = IMG_Load("reload.png")) == NULL)
+	{
+		printf("Unable to load bitmap: %s\n", SDL_GetError());
+		return -1;
+	}
+	if ((reloadSelectedPic = IMG_Load("reload_clicked.png")) == NULL)
+	{
+		printf("Unable to load bitmap: %s\n", SDL_GetError());
+		return -1;
+	}
+	//Load default levels
+	if ((file = fopen("defaultLevels.txt", "rt")) == NULL)
+	{
+		printf("Unable to load level\n");
+		return -1;
+	}
+	if ((defaultLevels = LoadLevels(file, &defaultLevelCount)) == NULL)
+	{
+		printf("Unable to parse level\n");
+		fclose(file);
+		return -1;
+	}
+	fclose(file);
+	//load time trial high scores
+	timeTHighScores[0] = 0;
+	timeTHighScores[1] = 0;
+	timeTHighScores[2] = 0;
+	if ((file = fopen("scores.txt", "rt")) != NULL)
+	{
+		fscanf(file, "%d,", &timeTHighScores[0]);
+		fscanf(file, "%d,", &timeTHighScores[1]);
+		fscanf(file, "%d", &timeTHighScores[2]);
+		fclose(file);
+	}
+	return 0;
+}
+
+void UnloadResources()
+{
+	SDL_FreeSurface(leftArrowPic);
+	SDL_FreeSurface(leftArrowSelectedPic);
+	SDL_FreeSurface(rightArrowPic);
+	SDL_FreeSurface(rightArrowSelectedPic);
+	SDL_FreeSurface(starPic);
+	SDL_FreeSurface(cMarkPic);
+	SDL_FreeSurface(menuPic);
+	SDL_FreeSurface(menuSelectedPic);
+	SDL_FreeSurface(screen);
+	TTF_CloseFont(fontTitle);
+	TTF_CloseFont(fontNormal);
+	TTF_CloseFont(fontSmall);
+}
+
+int Init()
+{
+	SDL_WM_SetCaption("Flow", "Flow");
+	SDL_initFramerate(&fpsM);
+	SDL_setFramerate(&fpsM, 30);
+	srand(SDL_GetTicks());
+
+	//Initialise game vars
+	gameState = MainMenu;
+	mousePositionDown.x = 0;
+	mousePositionDown.y = 0;
+	exiting = 0;
+	loadUserLevel = 1;
+	levels = defaultLevels;
+	userLevels = NULL;
+	currentLevelCount = defaultLevelCount;
+	currentLevelIndex = 0;
+	currentLevelSelectPage = 0;
+	levelSelectPageCount = 1 + (defaultLevelCount-1)/9;
+	aboutAnimation = 0;
+	mousePositionDown.x = 0;
+	mousePositionDown.y = 0;
+	isTimeTrialGame = 0;
+	currentTime = SDL_GetTicks();
+
+	//set button pictures
+	arrowBack.picture = leftArrowPic;
+	if ((rightArrowPic = FlipH(leftArrowPic)) == NULL)
+	{
+		printf("Unable to flip bitmap\n");
+		return -1;
+	}
+	if ((rightArrowSelectedPic = FlipH(leftArrowSelectedPic)) == NULL)
+	{
+		printf("Unable to flip bitmap\n");
+		return -1;
+	}
+	reload.picture = reloadPic;
+	arrowNext.picture = rightArrowPic;
+	arrowPrev.picture = leftArrowPic;
+	menuButton.picture = menuPic;
+
+	//set button positions
+	arrowNext.position.x = screen->w / 2 - (int)(leftArrowPic->w * 0.5) + LEVEL_CHANGE_ARROW_DIST;
+	arrowPrev.position.x = screen->w / 2 - (int)(leftArrowPic->w * 0.5) - LEVEL_CHANGE_ARROW_DIST;
+	menuButton.position.x = screen->w / 2 - menuButton.picture->w * 0.5;
+	return 0;
+}
+
+void Save()
+{
+	FILE *file;
+	Flow *f;
+	int i;
+	if ((file = fopen("defaultLevels.txt", "wt")) != NULL)
+	{
+		for (i = 0; i < defaultLevelCount; i++)
+		{
+			fprintf(file, "{");
+			for (f = defaultLevels[i].flowRoot; f != NULL; f = f->next)
+			{
+				fprintf(file, "{%d,%d,%d,%d},",
+					f->flowElementRoot->position.x + 1,
+					f->flowElementRoot->position.y + 1,
+					f->flowElementRoot->prev->position.x + 1,
+					f->flowElementRoot->prev->position.y + 1);
+			}
+			if (i == defaultLevelCount - 1)
+				fprintf(file, "%d,%d,0}", defaultLevels[i].size, defaultLevels[i].state);
+			else
+				fprintf(file, "%d,%d,0}\n", defaultLevels[i].size, defaultLevels[i].state);
+		}
+		fclose(file);
+	}
+	if ((file = fopen("scores.txt", "wt")) != NULL)
+	{
+		fprintf(file, "%d,%d,%d", timeTHighScores[0], timeTHighScores[1], timeTHighScores[2]);
+		fclose(file);
+	}
+}
+
+int main(int argc, char* argv[])
+{
+	Flow *f;
+	if(LoadResources() == -1)
+		return 1;
+	atexit(UnloadResources);
+	if(Init() == -1)
+		return 1;
+
+	//Main game loop
+	while (!exiting)
+	{
+		ProcessEvents();
+		if (Update() == -1)
+			return 1;
+		Draw();
+		SDL_framerateDelay(&fpsM);
+	}
+	Save();
+	return 0;
+}
